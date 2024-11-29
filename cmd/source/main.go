@@ -10,7 +10,7 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/gen2brain/malgo"
+	"github.com/gordonklaus/portaudio"
 	ffmpeg_go "github.com/u2takey/ffmpeg-go"
 )
 
@@ -60,7 +60,7 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 
 		// Send the request
 		resp, err := client.Do(req)
-		if err != nil {
+		if (err != nil) {
 			log.Fatalf("Could not perform request: %v", err)
 		}
 		defer func() {
@@ -100,28 +100,17 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 }
 
 func streamFromMic(serverURL, username, password string) error {
-	log.Printf("Initializing malgo context")
-	// Initialize malgo context
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
-		log.Printf("malgo message: %s", message)
-	})
+	log.Printf("Initializing PortAudio")
+	// Initialize PortAudio
+	err := portaudio.Initialize()
 	if err != nil {
-		log.Printf("Failed to initialize malgo context: %v", err)
-		return fmt.Errorf("could not initialize context: %v", err)
+		log.Printf("Failed to initialize PortAudio: %v", err)
+		return fmt.Errorf("could not initialize PortAudio: %v", err)
 	}
 	defer func() {
-		_ = ctx.Uninit()
-		ctx.Free()
-		log.Printf("Uninitialized malgo context")
+		portaudio.Terminate()
+		log.Printf("Terminated PortAudio")
 	}()
-
-	// Capture device configuration
-	log.Printf("Configuring capture device")
-	deviceConfig := malgo.DefaultDeviceConfig(malgo.Capture)
-	deviceConfig.Capture.Format = malgo.FormatS16
-	deviceConfig.Capture.Channels = 1
-	deviceConfig.SampleRate = 44100
-	deviceConfig.Alsa.NoMMap = 1 // For Linux ALSA
 
 	// Create a pipe to connect the audio input and HTTP request body
 	log.Printf("Creating pipe for audio data")
@@ -158,40 +147,32 @@ func streamFromMic(serverURL, username, password string) error {
 		}
 	}()
 
-	// Data callback function
-	log.Printf("Setting up data callback function")
-	onRecvFrames := func(outputSamples, inputSamples []byte, frameCount uint32) {
+	// Open default input stream
+	log.Printf("Opening default input stream")
+	stream, err := portaudio.OpenDefaultStream(1, 0, 44100, 1024, func(in []int16) {
 		// Write the captured audio data to the writer
-		_, err := writer.Write(inputSamples)
+		_, err := writer.Write(in)
 		if err != nil {
 			log.Printf("Error writing to pipe: %v", err)
 		} else {
-			log.Printf("Wrote %d bytes to pipe", len(inputSamples))
+			log.Printf("Wrote %d bytes to pipe", len(in))
 		}
-	}
-
-	deviceCallbacks := malgo.DeviceCallbacks{
-		Data: onRecvFrames,
-	}
-
-	// Initialize the capture device
-	log.Printf("Initializing capture device")
-	device, err := malgo.InitDevice(ctx.Context, deviceConfig, deviceCallbacks)
+	})
 	if err != nil {
-		log.Printf("Failed to initialize capture device: %v", err)
-		return fmt.Errorf("could not initialize capture device: %v", err)
+		log.Printf("Failed to open default input stream: %v", err)
+		return fmt.Errorf("could not open default input stream: %v", err)
 	}
 	defer func() {
-		device.Uninit()
-		log.Printf("Uninitialized capture device")
+		stream.Close()
+		log.Printf("Closed default input stream")
 	}()
 
-	// Start the device
-	log.Printf("Starting capture device")
-	err = device.Start()
+	// Start the stream
+	log.Printf("Starting input stream")
+	err = stream.Start()
 	if err != nil {
-		log.Printf("Failed to start capture device: %v", err)
-		return fmt.Errorf("could not start capture device: %v", err)
+		log.Printf("Failed to start input stream: %v", err)
+		return fmt.Errorf("could not start input stream: %v", err)
 	}
 
 	log.Println("Streaming from microphone. Press Ctrl+C to stop.")
@@ -202,12 +183,12 @@ func streamFromMic(serverURL, username, password string) error {
 	sig := <-sigs
 	log.Printf("Received signal: %v, shutting down", sig)
 
-	// Stop the device
-	log.Printf("Stopping capture device")
-	err = device.Stop()
+	// Stop the stream
+	log.Printf("Stopping input stream")
+	err = stream.Stop()
 	if err != nil {
-		log.Printf("Failed to stop capture device: %v", err)
-		return fmt.Errorf("could not stop capture device: %v", err)
+		log.Printf("Failed to stop input stream: %v", err)
+		return fmt.Errorf("could not stop input stream: %v", err)
 	}
 
 	// Close the writer to signal the end of data
