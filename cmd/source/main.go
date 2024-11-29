@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/gen2brain/malgo"
+	ffmpeg_go "github.com/u2takey/ffmpeg-go"
 )
 
 func main() {
@@ -44,52 +45,57 @@ func main() {
 }
 
 func streamFromFile(filePath, serverURL, username, password string) error {
-	log.Printf("Opening audio file: %s", filePath)
-	// Open the audio file
-	file, err := os.Open(filePath)
-	if err != nil {
-		log.Printf("Failed to open audio file: %v", err)
-		return fmt.Errorf("could not open audio file: %v", err)
-	}
-	defer func() {
-		file.Close()
-		log.Printf("Closed audio file")
+	// Create a pipe to connect ffmpeg output and HTTP request body
+	reader, writer := io.Pipe()
+
+	// Start the HTTP request in a goroutine
+	go func() {
+		client := &http.Client{}
+		req, err := http.NewRequest("PUT", serverURL, reader)
+		if err != nil {
+			log.Fatalf("Could not create request: %v", err)
+		}
+		req.SetBasicAuth(username, password)
+		req.Header.Set("Content-Type", "audio/mpeg") // Set Content-Type to audio/mpeg
+
+		// Send the request
+		resp, err := client.Do(req)
+		if err != nil {
+			log.Fatalf("Could not perform request: %v", err)
+		}
+		defer func() {
+			resp.Body.Close()
+			log.Printf("Closed server response")
+		}()
+
+		// Check response
+		log.Printf("Received server response: %s", resp.Status)
+		if resp.StatusCode != http.StatusOK {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			log.Fatalf("Server responded with status %s: %s", resp.Status, string(bodyBytes))
+		}
+
+		log.Printf("Streaming from file completed successfully")
 	}()
 
-	// Create an HTTP client and request
-	log.Printf("Creating HTTP PUT request to %s", serverURL)
-	client := &http.Client{}
-	req, err := http.NewRequest("PUT", serverURL, file)
+	// Use ffmpeg-go to stream the audio file in real-time
+	log.Printf("Starting ffmpeg to stream audio file in real-time")
+	err := ffmpeg_go.Input(filePath, ffmpeg_go.KwArgs{"re": ""}).
+		Output("pipe:", ffmpeg_go.KwArgs{
+			"format": "mp3",
+			"acodec": "copy",
+		}).
+		WithOutput(writer).
+		Run()
 	if err != nil {
-		log.Printf("Failed to create HTTP request: %v", err)
-		return fmt.Errorf("could not create request: %v", err)
+		log.Printf("FFmpeg error: %v", err)
+		return fmt.Errorf("could not stream audio file: %v", err)
 	}
 
-	// Set headers and basic auth
-	req.SetBasicAuth(username, password)
-	req.Header.Set("Content-Type", "audio/mpeg") // Set Content-Type to audio/mpeg
+	// Close the writer to signal the end of data
+	log.Printf("Closing writer pipe")
+	writer.Close()
 
-	// Perform the request
-	log.Printf("Sending HTTP request to server")
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("HTTP request failed: %v", err)
-		return fmt.Errorf("could not perform request: %v", err)
-	}
-	defer func() {
-		resp.Body.Close()
-		log.Printf("Closed server response")
-	}()
-
-	// Check response
-	log.Printf("Received server response: %s", resp.Status)
-	if resp.StatusCode != http.StatusOK {
-		bodyBytes, _ := io.ReadAll(resp.Body)
-		log.Printf("Server error response body: %s", string(bodyBytes))
-		return fmt.Errorf("server responded with status %s: %s", resp.Status, string(bodyBytes))
-	}
-
-	log.Printf("Streaming from file completed successfully")
 	return nil
 }
 
