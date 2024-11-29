@@ -74,16 +74,16 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Handle basic authentication
-	// user, pass, ok := r.BasicAuth()
-	// if !ok {
-	// 	w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
-	// 	http.Error(w, "Unauthorized", http.StatusUnauthorized)
-	// 	return
-	// }
+	user, pass, ok := r.BasicAuth()
+	if !ok {
+		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
 
 	// For simplicity, accept any credentials
 	log.Printf("Source connected")
-	// log.Printf("Source connected: user=%s, pass=%s", user, pass)
+	log.Printf("Source connected: user=%s, pass=%s", user, pass)
 
 	// Ensure only one source is connected at a time
 	sourceMu.Lock()
@@ -115,6 +115,7 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 
 			// Send the data to all connected clients
 			clientsMu.Lock()
+			log.Printf("Sending %d bytes to %d clients", n, len(clients))
 			for clientChan := range clients {
 				select {
 				case clientChan <- data:
