@@ -60,7 +60,7 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 
 		// Send the request
 		resp, err := client.Do(req)
-		if (err != nil) {
+		if err != nil {
 			log.Fatalf("Could not perform request: %v", err)
 		}
 		defer func() {
@@ -147,15 +147,40 @@ func streamFromMic(serverURL, username, password string) error {
 		}
 	}()
 
+	// List available devices
+	devices, err := portaudio.Devices()
+	if err != nil {
+		log.Printf("Failed to get devices: %v", err)
+		return fmt.Errorf("could not get devices: %v", err)
+	}
+	log.Println("Available devices:")
+	for i, device := range devices {
+		log.Printf("Device %d: %s", i, device.Name)
+	}
+
+	inputDevice, err := portaudio.DefaultInputDevice()
+	if err != nil {
+		log.Printf("Failed to get default input device: %v", err)
+		return fmt.Errorf("could not get default input device: %v", err)
+	}
+
+	log.Printf("Default input device: %+v", inputDevice)
 	// Open default input stream
 	log.Printf("Opening default input stream")
+
 	stream, err := portaudio.OpenDefaultStream(1, 0, 44100, 1024, func(in []int16) {
+		// Convert []int16 to []byte
+		buf := make([]byte, len(in)*2)
+		for i, v := range in {
+			buf[i*2] = byte(v)
+			buf[i*2+1] = byte(v >> 8)
+		}
 		// Write the captured audio data to the writer
-		_, err := writer.Write(in)
+		_, err := writer.Write(buf)
 		if err != nil {
 			log.Printf("Error writing to pipe: %v", err)
 		} else {
-			log.Printf("Wrote %d bytes to pipe", len(in))
+			log.Printf("Wrote %d bytes to pipe", len(buf))
 		}
 	})
 	if err != nil {
