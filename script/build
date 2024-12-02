@@ -1,0 +1,19 @@
+#!/bin/bash
+
+echo "Building server..."
+go build -o bin/server cmd/server/main.go 
+if [ $? -eq 0 ]; then
+  echo "Server build successful."
+else
+  echo "Server build failed."
+  exit 1
+fi
+
+echo "Building source..."
+go build -o bin/source cmd/source/main.go 
+if [ $? -eq 0 ]; then
+  echo "Source build successful."
+else
+  echo "Source build failed."
+  exit 1
+fi
