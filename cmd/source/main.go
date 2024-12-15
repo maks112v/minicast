@@ -11,6 +11,7 @@ import (
 
 	"github.com/gordonklaus/portaudio"
 	ffmpeg_go "github.com/u2takey/ffmpeg-go"
+	"github.com/viert/go-lame"
 	"go.uber.org/zap"
 )
 
@@ -117,109 +118,98 @@ func streamFromMic(serverURL, username, password string, logger *zap.SugaredLogg
 	reader, writer := io.Pipe()
 
 	// Start the HTTP request in a goroutine
-	logger.Info("Starting HTTP request goroutine")
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		client := &http.Client{}
 		req, err := http.NewRequest("PUT", serverURL, reader)
 		if err != nil {
 			logger.Errorf("Failed to create HTTP request: %v", err)
-			logger.Fatalf("Could not create request: %v", err)
+			return
 		}
 		req.SetBasicAuth(username, password)
-		req.Header.Set("Content-Type", "audio/pcm") // Using raw PCM data
+		req.Header.Set("Content-Type", "audio/mp3")
 
 		logger.Info("Sending HTTP request to server")
 		resp, err := client.Do(req)
 		if err != nil {
 			logger.Errorf("HTTP request failed: %v", err)
-			logger.Fatalf("Could not perform request: %v", err)
+			return
 		}
-		defer func() {
-			resp.Body.Close()
-			logger.Info("Closed server response")
-		}()
+		defer resp.Body.Close()
 
 		logger.Infof("Received server response: %s", resp.Status)
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
 			logger.Errorf("Server error response body: %s", string(bodyBytes))
-			logger.Fatalf("Server responded with status %s: %s", resp.Status, string(bodyBytes))
+			return
 		}
+
+		// Wait for streaming to complete
+		<-done
 	}()
 
-	// List available devices
-	devices, err := portaudio.Devices()
+	// Initialize LAME encoder
+	enc := lame.NewEncoder(writer)
+	defer enc.Close()
+
+	// Configure encoder
+	enc.SetQuality(5)
+	enc.SetInSamplerate(44100)
+	enc.SetNumChannels(1)
+
+	// Open input stream with PCM configuration
+	inputChannels := 1
+	sampleRate := 44100
+	framesPerBuffer := make([]byte, 4096)
+
+	stream, err := portaudio.OpenDefaultStream(
+		inputChannels,
+		0,
+		float64(sampleRate),
+		len(framesPerBuffer),
+		&framesPerBuffer,
+	)
 	if err != nil {
-		logger.Errorf("Failed to get devices: %v", err)
-		return fmt.Errorf("could not get devices: %v", err)
+		logger.Errorf("Failed to open stream: %v", err)
+		return err
 	}
-	logger.Info("Available devices:")
-	for i, device := range devices {
-		logger.Infof("Device %d: %s", i, device.Name)
-	}
+	defer stream.Close()
 
-	inputDevice, err := portaudio.DefaultInputDevice()
-	if err != nil {
-		logger.Errorf("Failed to get default input device: %v", err)
-		return fmt.Errorf("could not get default input device: %v", err)
+	if err := stream.Start(); err != nil {
+		logger.Errorf("Failed to start stream: %v", err)
+		return err
 	}
 
-	logger.Infof("Default input device: %+v", inputDevice)
-	// Open default input stream
-	logger.Info("Opening default input stream")
-
-	stream, err := portaudio.OpenDefaultStream(1, 0, 44100, 1024, func(in []int16) {
-		// Convert []int16 to []byte
-		buf := make([]byte, len(in)*2)
-		for i, v := range in {
-			buf[i*2] = byte(v)
-			buf[i*2+1] = byte(v >> 8)
-		}
-		// Write the captured audio data to the writer
-		_, err := writer.Write(buf)
-		if err != nil {
-			logger.Errorf("Error writing to pipe: %v", err)
-		} else {
-			logger.Infof("Wrote %d bytes to pipe", len(buf))
-		}
-	})
-	if err != nil {
-		logger.Errorf("Failed to open default input stream: %v", err)
-		return fmt.Errorf("could not open default input stream: %v", err)
-	}
-	defer func() {
-		stream.Close()
-		logger.Info("Closed default input stream")
-	}()
-
-	// Start the stream
-	logger.Info("Starting input stream")
-	err = stream.Start()
-	if err != nil {
-		logger.Errorf("Failed to start input stream: %v", err)
-		return fmt.Errorf("could not start input stream: %v", err)
-	}
-
-	logger.Info("Streaming from microphone. Press Ctrl+C to stop.")
-
-	// Handle interrupt signal for graceful shutdown
+	// Handle interrupt signal
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigs
-	logger.Infof("Received signal: %v, shutting down", sig)
 
-	// Stop the stream
-	logger.Info("Stopping input stream")
-	err = stream.Stop()
-	if err != nil {
-		logger.Errorf("Failed to stop input stream: %v", err)
-		return fmt.Errorf("could not stop input stream: %v", err)
+	logger.Info("Starting audio capture. Press Ctrl+C to stop.")
+
+	// Main capture loop
+	for {
+		select {
+		case sig := <-sigs:
+			logger.Infof("Received signal: %v, shutting down", sig)
+			stream.Stop()
+			enc.Close()
+			writer.Close()
+			return nil
+		default:
+			err := stream.Read()
+			if err != nil {
+				logger.Errorf("Error reading from stream: %v", err)
+				continue
+			}
+
+			// Write PCM data to encoder
+			n, err := enc.Write(framesPerBuffer)
+			if err != nil {
+				logger.Errorf("Error encoding audio: %v", err)
+				continue
+			}
+			logger.Debugf("Encoded %d bytes", n)
+		}
 	}
-
-	// Close the writer to signal the end of data
-	logger.Info("Closing writer pipe")
-	writer.Close()
-
-	logger.Info("Streaming stopped.")
-	return nil
 }

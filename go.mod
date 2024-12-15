@@ -5,6 +5,7 @@ go 1.23.2
 require (
 	github.com/gordonklaus/portaudio v0.0.0-20230709114228-aafa478834f5
 	github.com/u2takey/ffmpeg-go v0.5.0
+	github.com/viert/go-lame v0.0.0-20201108052322-bb552596b11d
 	go.uber.org/zap v1.27.0
 )
 
