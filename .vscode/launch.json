@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run Audio Streamer",
+      "type": "go",
+      "request": "launch",
+      "mode": "auto",
+      "program": "${workspaceFolder}/cmd/source/main.go",
+      "args": [
+        "-file",
+        "music.mp3",
+        "-url",
+        "http://localhost:8001/source",
+        "-user",
+        "sourceuser",
+        "-pass",
+        "sourcepass"
+      ],
+      "env": {},
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}

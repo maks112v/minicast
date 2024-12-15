@@ -4,47 +4,48 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/gen2brain/malgo"
+	"github.com/gordonklaus/portaudio"
 	ffmpeg_go "github.com/u2takey/ffmpeg-go"
+	"github.com/viert/go-lame"
+	"go.uber.org/zap"
 )
 
 func main() {
-	// Set up logging with timestamp and file info
-	log.SetFlags(log.LstdFlags | log.Lshortfile)
+	zap, _ := zap.NewProduction()
+	defer zap.Sync()
+	logger := zap.Sugar().With("module", "source")
 
-	// Define command-line flags
 	inputFile := flag.String("file", "", "Path to the audio file to stream")
 	serverURL := flag.String("url", "http://localhost:8000/source", "URL of the streaming server")
 	username := flag.String("user", "sourceuser", "Username for authentication")
 	password := flag.String("pass", "sourcepass", "Password for authentication")
 	flag.Parse()
 
-	log.Printf("Starting audio streamer...")
-	log.Printf("Server URL: %s", *serverURL)
+	logger.Info("Starting audio streamer...")
+	logger.Infof("Server URL: %s", *serverURL)
 	if *inputFile != "" {
-		log.Printf("Streaming from file: %s", *inputFile)
+		logger.Infof("Streaming from file: %s", *inputFile)
 		// Stream from file
-		err := streamFromFile(*inputFile, *serverURL, *username, *password)
+		err := streamFromFile(*inputFile, *serverURL, *username, *password, logger)
 		if err != nil {
-			log.Fatalf("Error streaming from file: %v", err)
+			logger.Fatalf("Error streaming from file: %v", err)
 		}
 	} else {
-		log.Printf("Streaming from microphone")
+		logger.Info("Streaming from microphone")
 		// Stream from microphone
-		err := streamFromMic(*serverURL, *username, *password)
+		err := streamFromMic(*serverURL, *username, *password, logger)
 		if err != nil {
-			log.Fatalf("Error streaming from microphone: %v", err)
+			logger.Fatalf("Error streaming from microphone: %v", err)
 		}
 	}
 }
 
-func streamFromFile(filePath, serverURL, username, password string) error {
+func streamFromFile(filePath, serverURL, username, password string, logger *zap.SugaredLogger) error {
 	// Create a pipe to connect ffmpeg output and HTTP request body
 	reader, writer := io.Pipe()
 
@@ -53,7 +54,7 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 		client := &http.Client{}
 		req, err := http.NewRequest("PUT", serverURL, reader)
 		if err != nil {
-			log.Fatalf("Could not create request: %v", err)
+			logger.Fatalf("Could not create request: %v", err)
 		}
 		req.SetBasicAuth(username, password)
 		req.Header.Set("Content-Type", "audio/mpeg") // Set Content-Type to audio/mpeg
@@ -61,25 +62,25 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 		// Send the request
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Fatalf("Could not perform request: %v", err)
+			logger.Fatalf("Could not perform request: %v", err)
 		}
 		defer func() {
 			resp.Body.Close()
-			log.Printf("Closed server response")
+			logger.Info("Closed server response")
 		}()
 
 		// Check response
-		log.Printf("Received server response: %s", resp.Status)
+		logger.Infof("Received server response: %s", resp.Status)
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			log.Fatalf("Server responded with status %s: %s", resp.Status, string(bodyBytes))
+			logger.Fatalf("Server responded with status %s: %s", resp.Status, string(bodyBytes))
 		}
 
-		log.Printf("Streaming from file completed successfully")
+		logger.Info("Streaming from file completed successfully")
 	}()
 
 	// Use ffmpeg-go to stream the audio file in real-time
-	log.Printf("Starting ffmpeg to stream audio file in real-time")
+	logger.Info("Starting ffmpeg to stream audio file in real-time")
 	err := ffmpeg_go.Input(filePath, ffmpeg_go.KwArgs{"re": ""}).
 		Output("pipe:", ffmpeg_go.KwArgs{
 			"format": "mp3",
@@ -88,132 +89,127 @@ func streamFromFile(filePath, serverURL, username, password string) error {
 		WithOutput(writer).
 		Run()
 	if err != nil {
-		log.Printf("FFmpeg error: %v", err)
+		logger.Errorf("FFmpeg error: %v", err)
 		return fmt.Errorf("could not stream audio file: %v", err)
 	}
 
 	// Close the writer to signal the end of data
-	log.Printf("Closing writer pipe")
+	logger.Info("Closing writer pipe")
 	writer.Close()
 
 	return nil
 }
 
-func streamFromMic(serverURL, username, password string) error {
-	log.Printf("Initializing malgo context")
-	// Initialize malgo context
-	ctx, err := malgo.InitContext(nil, malgo.ContextConfig{}, func(message string) {
-		log.Printf("malgo message: %s", message)
-	})
+func streamFromMic(serverURL, username, password string, logger *zap.SugaredLogger) error {
+	logger.Info("Initializing PortAudio")
+	// Initialize PortAudio
+	err := portaudio.Initialize()
 	if err != nil {
-		log.Printf("Failed to initialize malgo context: %v", err)
-		return fmt.Errorf("could not initialize context: %v", err)
+		logger.Errorf("Failed to initialize PortAudio: %v", err)
+		return fmt.Errorf("could not initialize PortAudio: %v", err)
 	}
 	defer func() {
-		_ = ctx.Uninit()
-		ctx.Free()
-		log.Printf("Uninitialized malgo context")
+		portaudio.Terminate()
+		logger.Info("Terminated PortAudio")
 	}()
 
-	// Capture device configuration
-	log.Printf("Configuring capture device")
-	deviceConfig := malgo.DefaultDeviceConfig(malgo.Capture)
-	deviceConfig.Capture.Format = malgo.FormatS16
-	deviceConfig.Capture.Channels = 1
-	deviceConfig.SampleRate = 44100
-	deviceConfig.Alsa.NoMMap = 1 // For Linux ALSA
-
 	// Create a pipe to connect the audio input and HTTP request body
-	log.Printf("Creating pipe for audio data")
+	logger.Info("Creating pipe for audio data")
 	reader, writer := io.Pipe()
 
 	// Start the HTTP request in a goroutine
-	log.Printf("Starting HTTP request goroutine")
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		client := &http.Client{}
 		req, err := http.NewRequest("PUT", serverURL, reader)
 		if err != nil {
-			log.Printf("Failed to create HTTP request: %v", err)
-			log.Fatalf("Could not create request: %v", err)
+			logger.Errorf("Failed to create HTTP request: %v", err)
+			return
 		}
 		req.SetBasicAuth(username, password)
-		req.Header.Set("Content-Type", "audio/pcm") // Using raw PCM data
+		req.Header.Set("Content-Type", "audio/mp3")
 
-		log.Printf("Sending HTTP request to server")
+		logger.Info("Sending HTTP request to server")
 		resp, err := client.Do(req)
 		if err != nil {
-			log.Printf("HTTP request failed: %v", err)
-			log.Fatalf("Could not perform request: %v", err)
+			logger.Errorf("HTTP request failed: %v", err)
+			return
 		}
-		defer func() {
-			resp.Body.Close()
-			log.Printf("Closed server response")
-		}()
+		defer resp.Body.Close()
 
-		log.Printf("Received server response: %s", resp.Status)
+		logger.Infof("Received server response: %s", resp.Status)
 		if resp.StatusCode != http.StatusOK {
 			bodyBytes, _ := io.ReadAll(resp.Body)
-			log.Printf("Server error response body: %s", string(bodyBytes))
-			log.Fatalf("Server responded with status %s: %s", resp.Status, string(bodyBytes))
+			logger.Errorf("Server error response body: %s", string(bodyBytes))
+			return
 		}
+
+		// Wait for streaming to complete
+		<-done
 	}()
 
-	// Data callback function
-	log.Printf("Setting up data callback function")
-	onRecvFrames := func(outputSamples, inputSamples []byte, frameCount uint32) {
-		// Write the captured audio data to the writer
-		_, err := writer.Write(inputSamples)
-		if err != nil {
-			log.Printf("Error writing to pipe: %v", err)
-		} else {
-			log.Printf("Wrote %d bytes to pipe", len(inputSamples))
-		}
-	}
+	// Initialize LAME encoder
+	enc := lame.NewEncoder(writer)
+	defer enc.Close()
 
-	deviceCallbacks := malgo.DeviceCallbacks{
-		Data: onRecvFrames,
-	}
+	// Configure encoder
+	enc.SetQuality(5)
+	enc.SetInSamplerate(44100)
+	enc.SetNumChannels(1)
 
-	// Initialize the capture device
-	log.Printf("Initializing capture device")
-	device, err := malgo.InitDevice(ctx.Context, deviceConfig, deviceCallbacks)
+	// Open input stream with PCM configuration
+	inputChannels := 1
+	sampleRate := 44100
+	framesPerBuffer := make([]byte, 4096)
+
+	stream, err := portaudio.OpenDefaultStream(
+		inputChannels,
+		0,
+		float64(sampleRate),
+		len(framesPerBuffer),
+		&framesPerBuffer,
+	)
 	if err != nil {
-		log.Printf("Failed to initialize capture device: %v", err)
-		return fmt.Errorf("could not initialize capture device: %v", err)
+		logger.Errorf("Failed to open stream: %v", err)
+		return err
 	}
-	defer func() {
-		device.Uninit()
-		log.Printf("Uninitialized capture device")
-	}()
+	defer stream.Close()
 
-	// Start the device
-	log.Printf("Starting capture device")
-	err = device.Start()
-	if err != nil {
-		log.Printf("Failed to start capture device: %v", err)
-		return fmt.Errorf("could not start capture device: %v", err)
+	if err := stream.Start(); err != nil {
+		logger.Errorf("Failed to start stream: %v", err)
+		return err
 	}
 
-	log.Println("Streaming from microphone. Press Ctrl+C to stop.")
-
-	// Handle interrupt signal for graceful shutdown
+	// Handle interrupt signal
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
-	sig := <-sigs
-	log.Printf("Received signal: %v, shutting down", sig)
 
-	// Stop the device
-	log.Printf("Stopping capture device")
-	err = device.Stop()
-	if err != nil {
-		log.Printf("Failed to stop capture device: %v", err)
-		return fmt.Errorf("could not stop capture device: %v", err)
+	logger.Info("Starting audio capture. Press Ctrl+C to stop.")
+
+	// Main capture loop
+	for {
+		select {
+		case sig := <-sigs:
+			logger.Infof("Received signal: %v, shutting down", sig)
+			stream.Stop()
+			enc.Close()
+			writer.Close()
+			return nil
+		default:
+			err := stream.Read()
+			if err != nil {
+				logger.Errorf("Error reading from stream: %v", err)
+				continue
+			}
+
+			// Write PCM data to encoder
+			n, err := enc.Write(framesPerBuffer)
+			if err != nil {
+				logger.Errorf("Error encoding audio: %v", err)
+				continue
+			}
+			logger.Debugf("Encoded %d bytes", n)
+		}
 	}
-
-	// Close the writer to signal the end of data
-	log.Printf("Closing writer pipe")
-	writer.Close()
-
-	log.Println("Streaming stopped.")
-	return nil
 }

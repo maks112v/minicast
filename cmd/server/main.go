@@ -2,37 +2,34 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"sync"
+
+	"go.uber.org/zap"
 )
 
 var (
-	// Mutex to protect the clients map
-	clientsMu sync.Mutex
-	// Map to keep track of connected clients
-	clients = make(map[chan []byte]struct{})
-	// Mutex and condition variable to handle source connection
+	clientsMu     sync.Mutex
+	clients       = make(map[chan []byte]struct{})
 	sourceMu      sync.Mutex
 	sourceReady   = sync.NewCond(&sourceMu)
 	sourceRunning bool
 )
 
-// Handler for incoming client connections
-func streamHandler(w http.ResponseWriter, r *http.Request) {
-	// Wait until the source is connected
-	log.Printf("Client connected")
+func streamHandler(w http.ResponseWriter, r *http.Request, logger *zap.SugaredLogger) {
+	logger.Info("Client connected")
+
+	// Set necessary headers for audio streaming
+	w.Header().Add("Content-Type", "audio/mpeg")
+	w.Header().Add("Transfer-Encoding", "chunked")
+	w.Header().Add("Connection", "keep-alive")
+
 	sourceMu.Lock()
 	for !sourceRunning {
 		sourceReady.Wait()
 	}
 	sourceMu.Unlock()
-
-	// Set necessary headers for audio streaming
-	w.Header().Set("Content-Type", "audio/mpeg")
-	w.Header().Set("Transfer-Encoding", "chunked")
 
 	// Create a channel for the client
 	clientChan := make(chan []byte, 1024)
@@ -41,7 +38,7 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	clientsMu.Lock()
 	clients[clientChan] = struct{}{}
 	clientsMu.Unlock()
-	log.Printf("Number of clients: %d", len(clients))
+	logger.Infof("Number of clients: %d", len(clients))
 
 	// Unregister the client when done
 	defer func() {
@@ -65,15 +62,12 @@ func streamHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Handler for the source (butt)
-func sourceHandler(w http.ResponseWriter, r *http.Request) {
-	// Check for HTTP PUT method
+func sourceHandler(w http.ResponseWriter, r *http.Request, logger *zap.SugaredLogger) {
 	if r.Method != "PUT" {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Handle basic authentication
 	user, pass, ok := r.BasicAuth()
 	if !ok {
 		w.Header().Set("WWW-Authenticate", `Basic realm="Restricted"`)
@@ -81,11 +75,9 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// For simplicity, accept any credentials
-	log.Printf("Source connected")
-	log.Printf("Source connected: user=%s, pass=%s", user, pass)
+	logger.Info("Source connected")
+	logger.Infof("Source connected: user=%s, pass=%s", user, pass)
 
-	// Ensure only one source is connected at a time
 	sourceMu.Lock()
 	if sourceRunning {
 		sourceMu.Unlock()
@@ -101,7 +93,7 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 		sourceMu.Lock()
 		sourceRunning = false
 		sourceMu.Unlock()
-		log.Println("Source disconnected")
+		logger.Info("Source disconnected")
 	}()
 
 	// Read data from the source and broadcast to clients
@@ -115,7 +107,7 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 
 			// Send the data to all connected clients
 			clientsMu.Lock()
-			log.Printf("Sending %d bytes to %d clients", n, len(clients))
+			// logger.Infof("Sending %d bytes to %d clients", n, len(clients))
 			for clientChan := range clients {
 				select {
 				case clientChan <- data:
@@ -130,18 +122,24 @@ func sourceHandler(w http.ResponseWriter, r *http.Request) {
 				// Source disconnected
 				break
 			}
-			log.Printf("Error reading from source: %v", err)
+			logger.Errorf("Error reading from source: %v", err)
 			break
 		}
 	}
 }
 
 func main() {
-	// Set up the HTTP handlers
-	http.HandleFunc("/stream", streamHandler)
-	http.HandleFunc("/source", sourceHandler)
+	zap, _ := zap.NewProduction()
+	defer zap.Sync()
+	logger := zap.Sugar().With("module", "server")
 
-	fmt.Println("Starting streaming server on http://localhost:8001/")
-	// Start the HTTP server
-	log.Fatal(http.ListenAndServe(":8001", nil))
+	http.HandleFunc("/stream", func(w http.ResponseWriter, r *http.Request) {
+		streamHandler(w, r, logger)
+	})
+	http.HandleFunc("/source", func(w http.ResponseWriter, r *http.Request) {
+		sourceHandler(w, r, logger)
+	})
+
+	logger.Info("Starting streaming server on http://localhost:8001/")
+	logger.Fatal(http.ListenAndServe(":8001", nil))
 }
