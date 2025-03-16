@@ -1,6 +1,6 @@
 module github.com/maks112v/minicast
 
-go 1.23.2
+go 1.23.6
 
 require (
 	github.com/gordonklaus/portaudio v0.0.0-20250206071425-98a94950218b
@@ -14,6 +14,6 @@ require (
 	github.com/aws/aws-sdk-go v1.55.6 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/u2takey/go-utils v0.3.1 // indirect
-	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/net v0.21.0 // indirect
+	go.uber.org/multierr v1.10.0 // indirect
+	golang.org/x/net v0.17.0 // indirect
 )
