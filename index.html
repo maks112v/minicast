@@ -2,182 +2,211 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <title>Audio Streaming Client</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MiniCast - Web Audio Streaming</title>
     <style>
       body {
-        font-family: Arial, sans-serif;
-        max-width: 600px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Oxygen, Ubuntu, Cantarell, "Open Sans", "Helvetica Neue", sans-serif;
+        max-width: 800px;
         margin: 0 auto;
         padding: 20px;
-        text-align: center;
+        background: #f5f5f5;
+      }
+      .container {
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
       }
       button {
-        font-size: 16px;
-        margin: 10px;
+        background: #007bff;
+        color: white;
+        border: none;
         padding: 10px 20px;
+        border-radius: 4px;
+        cursor: pointer;
+        font-size: 16px;
+        transition: background 0.2s;
       }
-      #debugInfo {
-        margin-top: 20px;
-        text-align: left;
-        background-color: #f0f0f0;
+      button:hover {
+        background: #0056b3;
+      }
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      .status {
+        margin: 20px 0;
         padding: 10px;
-        white-space: pre-wrap;
-        max-height: 200px;
-        overflow-y: auto;
+        border-radius: 4px;
+      }
+      .status.recording {
+        background: #ffeeba;
+        color: #856404;
+      }
+      .status.connected {
+        background: #d4edda;
+        color: #155724;
+      }
+      .status.error {
+        background: #f8d7da;
+        color: #721c24;
+      }
+      .visualizer {
+        width: 100%;
+        height: 100px;
+        background: #f8f9fa;
+        margin: 20px 0;
+        border-radius: 4px;
       }
     </style>
   </head>
   <body>
-    <h1>Audio Streaming Client</h1>
-    <div>
-      <button id="startButton">Start Streaming</button>
-      <button id="stopButton" disabled>Stop Streaming</button>
+    <div class="container">
+      <h1>MiniCast</h1>
+      <p>Simple browser-based audio streaming</p>
+
+      <div class="controls">
+        <button id="startButton">Start Streaming</button>
+        <button id="stopButton" disabled>Stop Streaming</button>
+      </div>
+
+      <div id="status" class="status"></div>
+      <canvas id="visualizer" class="visualizer"></canvas>
     </div>
-    <div id="status"></div>
-    <div id="debugInfo"></div>
 
     <script>
-      class AudioStreamer {
-        constructor() {
-          this.mediaRecorder = null;
-          this.audioChunks = [];
-          this.isStreaming = false;
-          this.startButton = document.getElementById("startButton");
-          this.stopButton = document.getElementById("stopButton");
-          this.statusDiv = document.getElementById("status");
-          this.debugDiv = document.getElementById("debugInfo");
+      let mediaRecorder;
+      let audioContext;
+      let analyser;
+      let isStreaming = false;
+      const ws = new WebSocket(`ws://${window.location.hostname}:8001/ws`);
+      const visualizer = document.getElementById("visualizer");
+      const ctx = visualizer.getContext("2d");
+      const status = document.getElementById("status");
 
-          this.startButton.addEventListener("click", () =>
-            this.startStreaming()
-          );
-          this.stopButton.addEventListener("click", () => this.stopStreaming());
-        }
+      // Set up WebSocket handlers
+      ws.onopen = () => {
+        status.textContent = "Connected to server";
+        status.className = "status connected";
+      };
 
-        debug(message) {
-          console.log(message);
-          this.debugDiv.textContent += message + "\n";
-        }
+      ws.onerror = (error) => {
+        status.textContent = "Connection error";
+        status.className = "status error";
+        console.error("WebSocket error:", error);
+      };
 
-        async startStreaming() {
-          try {
-            // Clear previous debug info
-            this.debugDiv.textContent = "";
+      // Audio visualization
+      function drawVisualizer(dataArray) {
+        const width = visualizer.width;
+        const height = visualizer.height;
+        const barWidth = width / dataArray.length;
 
-            // Request microphone access
-            const stream = await navigator.mediaDevices.getUserMedia({
-              audio: {
-                echoCancellation: false,
-                noiseSuppression: false,
-                autoGainControl: false,
-              },
-            });
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = "#007bff";
 
-            // Create media recorder
-            this.mediaRecorder = new MediaRecorder(stream, {
-              mimeType: this.findSupportedMimeType(),
-            });
-
-            this.debug(`Selected MIME Type: ${this.mediaRecorder.mimeType}`);
-
-            // Prepare streaming
-            this.audioChunks = [];
-            this.mediaRecorder.ondataavailable = async (event) => {
-              if (event.data.size > 0) {
-                try {
-                  this.audioChunks.push(event.data);
-                  await this.sendAudioChunk(event.data);
-                } catch (error) {
-                  this.debug(`Chunk processing error: ${error.message}`);
-                  this.updateStatus(`Chunk Error: ${error.message}`);
-                }
-              }
-            };
-
-            // Start recording and streaming
-            this.mediaRecorder.start(250); // Increased interval to 250ms
-            this.isStreaming = true;
-
-            // Update UI
-            this.startButton.disabled = true;
-            this.stopButton.disabled = false;
-            this.updateStatus("Streaming audio...");
-          } catch (error) {
-            this.debug(`Streaming start error: ${error.message}`);
-            this.updateStatus(`Error: ${error.message}`);
-            console.error("Streaming error:", error);
-          }
-        }
-
-        findSupportedMimeType() {
-          const mimeTypes = [
-            "audio/webm",
-            "audio/ogg",
-            "audio/mp4",
-            "audio/wav",
-          ];
-
-          for (let mimeType of mimeTypes) {
-            if (MediaRecorder.isTypeSupported(mimeType)) {
-              return mimeType;
-            }
-          }
-
-          throw new Error("No supported audio MIME type found");
-        }
-
-        async sendAudioChunk(chunk) {
-          try {
-            this.debug(`Chunk size: ${chunk.size} bytes`);
-            this.debug(`Chunk type: ${chunk.type}`);
-
-            // Log blob details
-            const arrayBuffer = await chunk.arrayBuffer();
-            this.debug(`ArrayBuffer size: ${arrayBuffer.byteLength} bytes`);
-
-            // Directly send the audio chunk as-is
-            const response = await fetch("http://localhost:8001/source", {
-              method: "PUT",
-              headers: {
-                Authorization: "Basic " + btoa("source:password"),
-                "Content-Type": chunk.type,
-              },
-              body: chunk,
-            });
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              throw new Error(
-                `Server responded with ${response.status}: ${errorText}`
-              );
-            }
-          } catch (error) {
-            this.debug(`Send error details: ${error.message}`);
-            this.updateStatus(`Send error: ${error.message}`);
-            console.error("Send error:", error);
-            this.stopStreaming();
-          }
-        }
-
-        stopStreaming() {
-          if (this.mediaRecorder) {
-            this.mediaRecorder.stop();
-          }
-          this.isStreaming = false;
-
-          // Update UI
-          this.startButton.disabled = false;
-          this.stopButton.disabled = true;
-          this.updateStatus("Streaming stopped");
-        }
-
-        updateStatus(message) {
-          this.statusDiv.textContent = message;
-          this.debug(message);
+        for (let i = 0; i < dataArray.length; i++) {
+          const barHeight = (dataArray[i] / 255) * height;
+          ctx.fillRect(i * barWidth, height - barHeight, barWidth, barHeight);
         }
       }
 
-      // Initialize the audio streamer when the page loads
-      const audioStreamer = new AudioStreamer();
+      // Start streaming
+      async function startStreaming() {
+        try {
+          const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              sampleRate: 44100,
+              channelCount: 1,
+            },
+          });
+
+          // Set up audio context and analyzer
+          audioContext = new AudioContext({
+            sampleRate: 44100,
+          });
+          const source = audioContext.createMediaStreamSource(stream);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 256;
+          source.connect(analyser);
+
+          // Set up media recorder with MP3 mime type
+          const options = {
+            mimeType: "audio/webm;codecs=opus",
+            audioBitsPerSecond: 128000,
+          };
+
+          mediaRecorder = new MediaRecorder(stream, options);
+          mediaRecorder.ondataavailable = (event) => {
+            if (event.data.size > 0 && ws.readyState === WebSocket.OPEN) {
+              ws.send(event.data);
+            }
+          };
+
+          // Start recording with smaller time slices for lower latency
+          mediaRecorder.start(50);
+          isStreaming = true;
+          status.textContent = "Streaming audio...";
+          status.className = "status recording";
+
+          // Update buttons
+          document.getElementById("startButton").disabled = true;
+          document.getElementById("stopButton").disabled = false;
+
+          // Start visualization
+          const dataArray = new Uint8Array(analyser.frequencyBinCount);
+          function animate() {
+            if (isStreaming) {
+              requestAnimationFrame(animate);
+              analyser.getByteFrequencyData(dataArray);
+              drawVisualizer(dataArray);
+            }
+          }
+          animate();
+        } catch (error) {
+          console.error("Error accessing microphone:", error);
+          status.textContent = "Error accessing microphone";
+          status.className = "status error";
+        }
+      }
+
+      // Stop streaming
+      function stopStreaming() {
+        if (mediaRecorder && mediaRecorder.state !== "inactive") {
+          mediaRecorder.stop();
+          mediaRecorder.stream.getTracks().forEach((track) => track.stop());
+          isStreaming = false;
+          status.textContent = "Streaming stopped";
+          status.className = "status";
+
+          // Update buttons
+          document.getElementById("startButton").disabled = false;
+          document.getElementById("stopButton").disabled = true;
+
+          // Clear visualizer
+          ctx.clearRect(0, 0, visualizer.width, visualizer.height);
+        }
+      }
+
+      // Event listeners
+      document
+        .getElementById("startButton")
+        .addEventListener("click", startStreaming);
+      document
+        .getElementById("stopButton")
+        .addEventListener("click", stopStreaming);
+
+      // Handle canvas resize
+      function resizeCanvas() {
+        visualizer.width = visualizer.clientWidth;
+        visualizer.height = visualizer.clientHeight;
+      }
+      window.addEventListener("resize", resizeCanvas);
+      resizeCanvas();
     </script>
   </body>
 </html>
