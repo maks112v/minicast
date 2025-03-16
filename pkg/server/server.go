@@ -33,7 +33,10 @@ func New(logger *zap.SugaredLogger) *Server {
 func (s *Server) Start(addr string) error {
 	// Serve static files from the current directory
 	fs := http.FileServer(http.Dir("."))
-	http.Handle("/", fs)
+	http.Handle("/static/", http.StripPrefix("/static/", fs))
+
+	// Root endpoint serves index.html
+	http.HandleFunc("/", s.corsMiddleware(s.serveIndexPage))
 
 	// WebSocket endpoint
 	http.HandleFunc("/ws", s.corsMiddleware(s.handleWebSocket))
@@ -79,6 +82,23 @@ func (s *Server) handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.wsManager.HandleSource(conn)
 	} else {
 		s.wsManager.HandleListener(conn)
+	}
+}
+
+// serveIndexPage serves the index page
+func (s *Server) serveIndexPage(w http.ResponseWriter, r *http.Request) {
+	tmpl, err := template.ParseFS(templates, "templates/index.html")
+	if err != nil {
+		s.logger.Errorf("Failed to parse template: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html")
+	if err := tmpl.Execute(w, nil); err != nil {
+		s.logger.Errorf("Failed to execute template: %v", err)
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
 	}
 }
 
