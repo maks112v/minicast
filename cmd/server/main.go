@@ -1,9 +1,7 @@
 package main
 
 import (
-	"bytes"
 	"net/http"
-	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -11,177 +9,129 @@ import (
 )
 
 var (
-	clientsMu     sync.Mutex
-	clients       = make(map[chan []byte]struct{})
-	sourceMu      sync.Mutex
-	sourceReady   = sync.NewCond(&sourceMu)
-	sourceRunning bool
-	upgrader      = websocket.Upgrader{
+	// WebSocket upgrader
+	upgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true // Allow all origins for development
 		},
 	}
-	// Buffer for audio data
-	audioBuffer = &bytes.Buffer{}
+
+	// Manage connected clients
+	clientsMu sync.RWMutex
+	clients   = make(map[*websocket.Conn]bool)
+
+	// Manage audio source
+	sourceMu     sync.RWMutex
+	sourceConn   *websocket.Conn
+	audioChannel = make(chan []byte, 1024)
 )
 
 func corsMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Allow all origins
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-
-		// Allow specific HTTP methods
 		w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, OPTIONS")
-
-		// Allow specific headers
 		w.Header().Set("Access-Control-Allow-Headers",
 			"Content-Type, Authorization, Accept, Origin, X-Requested-With")
 
-		// Handle preflight requests
 		if r.Method == "OPTIONS" {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		// Call the next handler
 		next.ServeHTTP(w, r)
 	}
 }
 
-func streamHandler(w http.ResponseWriter, r *http.Request, logger *zap.SugaredLogger) {
-	logger.Info("Client connected to stream")
-
-	// Set headers for audio streaming
-	w.Header().Set("Content-Type", "audio/webm;codecs=opus")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("Transfer-Encoding", "chunked")
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-
-	// Create a channel for this client
-	clientChan := make(chan []byte, 1024)
-	ctx := r.Context()
-
-	// Register client
-	clientsMu.Lock()
-	clients[clientChan] = struct{}{}
-	clientsMu.Unlock()
-	logger.Infof("Number of clients: %d", len(clients))
-
-	// Clean up when done
-	defer func() {
-		clientsMu.Lock()
-		delete(clients, clientChan)
-		clientsMu.Unlock()
-		close(clientChan)
-		logger.Info("Client disconnected from stream")
-	}()
-
-	// Send initial audio data if available
-	audioBufferCopy := make([]byte, audioBuffer.Len())
-	copy(audioBufferCopy, audioBuffer.Bytes())
-	if len(audioBufferCopy) > 0 {
-		if err := writeData(w, audioBufferCopy); err != nil {
-			logger.Debugf("Error writing initial data: %v", err)
-			return
-		}
-	}
-
-	// Stream new data as it comes in
-	for {
-		select {
-		case <-ctx.Done():
-			logger.Info("Client connection closed by context")
-			return
-		case data, ok := <-clientChan:
-			if !ok {
-				return
-			}
-			if err := writeData(w, data); err != nil {
-				if isConnectionClosed(err) {
-					logger.Debug("Client connection closed")
-				} else {
-					logger.Debugf("Error writing data: %v", err)
-				}
-				return
-			}
-		}
-	}
-}
-
-// writeData writes data to the response writer and flushes it
-func writeData(w http.ResponseWriter, data []byte) error {
-	if _, err := w.Write(data); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
-}
-
-// isConnectionClosed checks if the error is due to a closed connection
-func isConnectionClosed(err error) bool {
-	if err == nil {
-		return false
-	}
-	str := err.Error()
-	return strings.Contains(str, "broken pipe") ||
-		strings.Contains(str, "connection reset by peer") ||
-		strings.Contains(str, "client disconnected") ||
-		strings.Contains(str, "i/o timeout")
-}
-
 func wsHandler(w http.ResponseWriter, r *http.Request, logger *zap.SugaredLogger) {
-	logger.Info("WebSocket client attempting to connect")
-
+	// Upgrade HTTP connection to WebSocket
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Errorf("Failed to upgrade connection: %v", err)
 		return
 	}
-	defer conn.Close()
 
-	logger.Info("WebSocket client connected")
+	// Check if this is a source connection (streaming from microphone)
+	isSource := r.URL.Query().Get("source") == "true"
+
+	if isSource {
+		handleSource(conn, logger)
+	} else {
+		handleListener(conn, logger)
+	}
+}
+
+func handleSource(conn *websocket.Conn, logger *zap.SugaredLogger) {
+	logger.Info("Audio source connected")
 
 	sourceMu.Lock()
-	sourceRunning = true
-	sourceReady.Broadcast()
+	if sourceConn != nil {
+		sourceMu.Unlock()
+		conn.WriteMessage(websocket.TextMessage, []byte("Another source is already connected"))
+		conn.Close()
+		return
+	}
+	sourceConn = conn
 	sourceMu.Unlock()
 
 	defer func() {
 		sourceMu.Lock()
-		sourceRunning = false
+		if sourceConn == conn {
+			sourceConn = nil
+		}
 		sourceMu.Unlock()
-		logger.Info("WebSocket client disconnected")
+		conn.Close()
+		logger.Info("Audio source disconnected")
 	}()
 
 	for {
 		messageType, data, err := conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				logger.Errorf("WebSocket error: %v", err)
+				logger.Errorf("Source WebSocket error: %v", err)
 			}
 			break
 		}
 
 		if messageType == websocket.BinaryMessage {
-			// Store audio data in buffer
-			audioBuffer.Write(data)
-			if audioBuffer.Len() > 1024*1024 { // Keep last 1MB of audio
-				audioBuffer.Reset()
-			}
-
-			// Broadcast to clients
-			clientsMu.Lock()
-			for clientChan := range clients {
-				select {
-				case clientChan <- data:
-				default:
-					// Skip if client buffer is full
+			// Broadcast to all listeners
+			clientsMu.RLock()
+			for client := range clients {
+				err := client.WriteMessage(websocket.BinaryMessage, data)
+				if err != nil {
+					logger.Debugf("Error sending to listener: %v", err)
+					client.Close()
+					delete(clients, client)
 				}
 			}
-			clientsMu.Unlock()
+			clientsMu.RUnlock()
+		}
+	}
+}
+
+func handleListener(conn *websocket.Conn, logger *zap.SugaredLogger) {
+	logger.Info("Listener connected")
+
+	// Add to clients map
+	clientsMu.Lock()
+	clients[conn] = true
+	clientsMu.Unlock()
+
+	defer func() {
+		clientsMu.Lock()
+		delete(clients, conn)
+		clientsMu.Unlock()
+		conn.Close()
+		logger.Info("Listener disconnected")
+	}()
+
+	// Keep the connection alive and handle any incoming messages
+	for {
+		_, _, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				logger.Debugf("Listener WebSocket error: %v", err)
+			}
+			break
 		}
 	}
 }
@@ -246,25 +196,27 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
             margin: 16px 0;
         }
 
-        audio {
+        .controls {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .volume-control {
             width: 100%;
-            margin: 0;
+            margin-top: 8px;
+        }
+
+        .volume-control input {
+            width: 100%;
+        }
+
+        .visualizer {
+            width: 100%;
+            height: 60px;
+            background: var(--background-color);
             border-radius: 8px;
-            height: 40px;
-        }
-
-        /* Improve audio controls on iOS */
-        audio::-webkit-media-controls-panel {
-            background-color: var(--background-color);
-        }
-
-        audio::-webkit-media-controls-play-button {
-            background-color: var(--primary-color);
-            border-radius: 50%;
-        }
-
-        audio::-webkit-media-controls-timeline {
-            border-radius: 4px;
+            margin-top: 16px;
         }
 
         .status {
@@ -276,13 +228,6 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
             text-align: center;
         }
 
-        .status code {
-            background: rgba(0,0,0,0.05);
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: monospace;
-        }
-
         .error {
             background-color: #fff3f3;
             color: var(--error-color);
@@ -291,13 +236,6 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
             border-radius: 8px;
             margin-top: 16px;
             text-align: center;
-        }
-
-        .reconnecting {
-            display: none;
-            text-align: center;
-            margin-top: 16px;
-            color: var(--primary-color);
         }
 
         @media (max-width: 480px) {
@@ -316,13 +254,8 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
             .player-wrapper {
                 padding: 12px;
             }
-
-            audio {
-                height: 36px;
-            }
         }
 
-        /* Dark mode support */
         @media (prefers-color-scheme: dark) {
             :root {
                 --background-color: #1a1a1a;
@@ -336,10 +269,6 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
             .container {
                 background: #2d2d2d;
             }
-
-            .status code {
-                background: rgba(255,255,255,0.1);
-            }
         }
     </style>
 </head>
@@ -347,75 +276,155 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
     <div class="container">
         <h1>MiniCast Player</h1>
         <div class="player-wrapper">
-            <audio id="audioPlayer" controls autoplay playsinline>
-                <source src="/stream" type="audio/webm;codecs=opus">
-                Your browser does not support the audio element.
-            </audio>
-        </div>
-        <div class="status">
-            Stream URL: <code>/stream</code>
+            <div class="controls">
+                <div id="status" class="status">Connecting to stream...</div>
+                <canvas id="visualizer" class="visualizer"></canvas>
+                <div class="volume-control">
+                    <input type="range" id="volume" min="0" max="100" value="100">
+                </div>
+            </div>
         </div>
         <div id="error" class="error">
             Connection lost. Attempting to reconnect...
         </div>
-        <div id="reconnecting" class="reconnecting">
-            Reconnecting...
-        </div>
     </div>
     <script>
-        const audio = document.getElementById('audioPlayer');
-        const errorDiv = document.getElementById('error');
-        const reconnectingDiv = document.getElementById('reconnecting');
+        let audioContext;
+        let audioSource;
+        let gainNode;
+        let analyser;
+        let ws;
         let reconnectAttempts = 0;
         const maxReconnectAttempts = 5;
         
-        function showError() {
+        const visualizer = document.getElementById('visualizer');
+        const ctx = visualizer.getContext('2d');
+        const volumeControl = document.getElementById('volume');
+        const statusDiv = document.getElementById('status');
+        const errorDiv = document.getElementById('error');
+
+        function showError(message) {
+            errorDiv.textContent = message;
             errorDiv.style.display = 'block';
-            reconnectingDiv.style.display = 'none';
+            statusDiv.style.display = 'none';
         }
 
-        function showReconnecting() {
+        function showStatus(message) {
+            statusDiv.textContent = message;
+            statusDiv.style.display = 'block';
             errorDiv.style.display = 'none';
-            reconnectingDiv.style.display = 'block';
         }
 
-        function hideMessages() {
-            errorDiv.style.display = 'none';
-            reconnectingDiv.style.display = 'none';
+        function setupAudioContext() {
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            gainNode = audioContext.createGain();
+            analyser = audioContext.createAnalyser();
+            analyser.fftSize = 256;
+
+            gainNode.connect(audioContext.destination);
+            gainNode.connect(analyser);
+
+            volumeControl.addEventListener('input', (e) => {
+                gainNode.gain.value = e.target.value / 100;
+            });
         }
 
-        function reconnect() {
-            if (reconnectAttempts >= maxReconnectAttempts) {
-                showError();
-                return;
+        function drawVisualizer() {
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            const width = visualizer.width;
+            const height = visualizer.height;
+            const barWidth = width / bufferLength;
+
+            function draw() {
+                requestAnimationFrame(draw);
+
+                analyser.getByteFrequencyData(dataArray);
+                ctx.fillStyle = '#000';
+                ctx.fillRect(0, 0, width, height);
+
+                for (let i = 0; i < bufferLength; i++) {
+                    const barHeight = (dataArray[i] / 255) * height;
+                    ctx.fillStyle = 'hsl(' + (i * 360 / bufferLength) + ', 100%, 50%)';
+                    ctx.fillRect(i * barWidth, height - barHeight, barWidth - 1, barHeight);
+                }
             }
 
-            showReconnecting();
-            reconnectAttempts++;
-            
-            setTimeout(() => {
-                audio.src = '/stream';
-                audio.load();
-                audio.play().catch(console.error);
-            }, 1000 * Math.min(reconnectAttempts, 3));
+            draw();
         }
 
-        audio.addEventListener('error', (e) => {
-            console.error('Audio error:', e);
-            reconnect();
+        function connectWebSocket() {
+            if (ws) {
+                ws.close();
+            }
+
+            ws = new WebSocket('ws://' + window.location.host + '/ws');
+            
+            ws.onopen = () => {
+                showStatus('Connected to stream');
+                reconnectAttempts = 0;
+            };
+
+            ws.onclose = () => {
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    showError('Connection lost. Reconnecting...');
+                    setTimeout(connectWebSocket, 1000 * Math.min(reconnectAttempts, 3));
+                } else {
+                    showError('Connection lost. Please refresh the page.');
+                }
+            };
+
+            ws.onmessage = async (event) => {
+                try {
+                    const arrayBuffer = await event.data.arrayBuffer();
+                    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+                    
+                    const source = audioContext.createBufferSource();
+                    source.buffer = audioBuffer;
+                    source.connect(gainNode);
+                    source.start(0);
+                } catch (error) {
+                    console.error('Error playing audio:', error);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                showError('Connection error');
+            };
+        }
+
+        // Initialize audio context and visualizer
+        function init() {
+            setupAudioContext();
+            
+            // Set up visualizer canvas
+            visualizer.width = visualizer.clientWidth;
+            visualizer.height = visualizer.clientHeight;
+            
+            // Start WebSocket connection
+            connectWebSocket();
+            
+            // Start visualization
+            drawVisualizer();
+        }
+
+        // Handle window resize
+        window.addEventListener('resize', () => {
+            visualizer.width = visualizer.clientWidth;
+            visualizer.height = visualizer.clientHeight;
         });
 
-        audio.addEventListener('playing', () => {
-            hideMessages();
-            reconnectAttempts = 0;
-        });
+        // Start everything when the page loads
+        window.addEventListener('load', init);
 
         // Handle page visibility changes
         document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState === 'visible' && audio.paused) {
-                audio.src = '/stream';
-                audio.load();
-                audio.play().catch(console.error);
+            if (document.visibilityState === 'visible') {
+                if (ws.readyState !== WebSocket.OPEN) {
+                    connectWebSocket();
+                }
             }
         });
 
@@ -431,13 +440,6 @@ func serveStreamPage(w http.ResponseWriter, r *http.Request) {
         }
         
         preventSleep();
-
-        // Handle iOS audio session
-        document.addEventListener('touchstart', () => {
-            if (audio.paused) {
-                audio.play().catch(console.error);
-            }
-        }, { once: true });
     </script>
 </body>
 </html>`
@@ -454,14 +456,9 @@ func main() {
 	fs := http.FileServer(http.Dir("."))
 	http.Handle("/", fs)
 
-	// WebSocket endpoint for browser-based streaming
+	// WebSocket endpoint
 	http.HandleFunc("/ws", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		wsHandler(w, r, logger)
-	}))
-
-	// HTTP endpoints for compatibility with existing clients
-	http.HandleFunc("/stream", corsMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		streamHandler(w, r, logger)
 	}))
 
 	// Serve the stream player page
