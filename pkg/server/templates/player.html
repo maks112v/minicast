@@ -67,6 +67,38 @@
         gap: 12px;
       }
 
+      .playback-controls {
+        display: flex;
+        justify-content: center;
+        gap: 16px;
+        margin-bottom: 12px;
+      }
+
+      .control-btn {
+        background: var(--primary-color);
+        color: white;
+        border: none;
+        border-radius: 50%;
+        width: 48px;
+        height: 48px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: all 0.2s ease;
+      }
+
+      .control-btn:hover {
+        background: #0069d9;
+        transform: scale(1.05);
+      }
+
+      .control-btn:disabled {
+        background: #6c757d;
+        cursor: not-allowed;
+        opacity: 0.7;
+      }
+
       .volume-control {
         width: 100%;
         margin-top: 8px;
@@ -143,6 +175,10 @@
       <div class="player-wrapper">
         <div class="controls">
           <div id="status" class="status">Connecting to stream...</div>
+          <div class="playback-controls">
+            <button id="playBtn" class="control-btn" disabled>▶</button>
+            <button id="pauseBtn" class="control-btn" disabled>❚❚</button>
+          </div>
           <canvas id="visualizer" class="visualizer"></canvas>
           <div class="volume-control">
             <input type="range" id="volume" min="0" max="100" value="100" />
@@ -161,12 +197,17 @@
       let ws;
       let reconnectAttempts = 0;
       const maxReconnectAttempts = 5;
+      let isPlaying = false;
+      let audioQueue = [];
+      let currentSource = null;
 
       const visualizer = document.getElementById("visualizer");
       const ctx = visualizer.getContext("2d");
       const volumeControl = document.getElementById("volume");
       const statusDiv = document.getElementById("status");
       const errorDiv = document.getElementById("error");
+      const playBtn = document.getElementById("playBtn");
+      const pauseBtn = document.getElementById("pauseBtn");
 
       function showError(message) {
         errorDiv.textContent = message;
@@ -205,12 +246,19 @@
           requestAnimationFrame(draw);
 
           analyser.getByteFrequencyData(dataArray);
-          ctx.fillStyle = "#000";
+          ctx.clearRect(0, 0, width, height);
+
+          // Use a gradient background instead of solid black
+          const gradient = ctx.createLinearGradient(0, 0, 0, height);
+          gradient.addColorStop(0, "rgba(0, 123, 255, 0.1)");
+          gradient.addColorStop(1, "rgba(0, 123, 255, 0.02)");
+          ctx.fillStyle = gradient;
           ctx.fillRect(0, 0, width, height);
 
           for (let i = 0; i < bufferLength; i++) {
             const barHeight = (dataArray[i] / 255) * height;
-            ctx.fillStyle = "hsl(" + (i * 360) / bufferLength + ", 100%, 50%)";
+            const hue = (i * 360) / bufferLength;
+            ctx.fillStyle = `hsl(${hue}, 80%, 50%)`;
             ctx.fillRect(
               i * barWidth,
               height - barHeight,
@@ -228,11 +276,21 @@
           ws.close();
         }
 
-        ws = new WebSocket("ws://" + window.location.host + "/ws");
+        // Use secure WebSocket if the page is loaded over HTTPS
+        const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+        ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
 
         ws.onopen = () => {
           showStatus("Connected to stream");
           reconnectAttempts = 0;
+          playBtn.disabled = false;
+
+          // Auto-play when connected (optional)
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              console.log("AudioContext resumed successfully");
+            });
+          }
         };
 
         ws.onclose = () => {
@@ -243,6 +301,8 @@
           } else {
             showError("Connection lost. Please refresh the page.");
           }
+          playBtn.disabled = true;
+          pauseBtn.disabled = true;
         };
 
         ws.onmessage = async (event) => {
@@ -250,34 +310,108 @@
             const arrayBuffer = await event.data.arrayBuffer();
             const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
 
-            const source = audioContext.createBufferSource();
-            source.buffer = audioBuffer;
-            source.connect(gainNode);
-            source.start(0);
+            if (isPlaying) {
+              playAudioBuffer(audioBuffer);
+            } else {
+              audioQueue.push(audioBuffer);
+              // Keep queue from growing too large
+              if (audioQueue.length > 10) {
+                audioQueue.shift();
+              }
+            }
           } catch (error) {
-            console.error("Error playing audio:", error);
+            console.error("Error processing audio:", error);
           }
         };
 
         ws.onerror = (error) => {
           console.error("WebSocket error:", error);
           showError("Connection error");
+          playBtn.disabled = true;
+          pauseBtn.disabled = true;
         };
+      }
+
+      function playAudioBuffer(buffer) {
+        const source = audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(gainNode);
+        source.start(0);
+        currentSource = source;
+
+        // Enable pause button when playing
+        pauseBtn.disabled = false;
+      }
+
+      function playAudio() {
+        if (audioContext.state === "suspended") {
+          audioContext
+            .resume()
+            .then(() => {
+              console.log("AudioContext resumed successfully");
+            })
+            .catch((err) => {
+              console.error("Failed to resume AudioContext:", err);
+            });
+        }
+
+        isPlaying = true;
+        showStatus("Playing stream");
+
+        // Play any queued audio
+        while (audioQueue.length > 0) {
+          playAudioBuffer(audioQueue.shift());
+        }
+
+        playBtn.disabled = true;
+        pauseBtn.disabled = false;
+      }
+
+      function pauseAudio() {
+        if (audioContext.state === "running") {
+          audioContext.suspend();
+        }
+
+        isPlaying = false;
+        showStatus("Stream paused");
+
+        playBtn.disabled = false;
+        pauseBtn.disabled = true;
       }
 
       // Initialize audio context and visualizer
       function init() {
-        setupAudioContext();
+        // Create audio context on user interaction to comply with autoplay policies
+        const setupAudioOnInteraction = () => {
+          if (!audioContext) {
+            setupAudioContext();
 
-        // Set up visualizer canvas
-        visualizer.width = visualizer.clientWidth;
-        visualizer.height = visualizer.clientHeight;
+            // Set up visualizer canvas
+            visualizer.width = visualizer.clientWidth;
+            visualizer.height = visualizer.clientHeight;
 
-        // Start WebSocket connection
-        connectWebSocket();
+            // Start visualization
+            drawVisualizer();
 
-        // Start visualization
-        drawVisualizer();
+            // Start WebSocket connection
+            connectWebSocket();
+
+            // Remove event listeners once initialized
+            document.removeEventListener("click", setupAudioOnInteraction);
+            document.removeEventListener("touchstart", setupAudioOnInteraction);
+          }
+        };
+
+        // Set up event listeners for user interaction
+        document.addEventListener("click", setupAudioOnInteraction);
+        document.addEventListener("touchstart", setupAudioOnInteraction);
+
+        // Also try to initialize immediately for browsers that allow it
+        setupAudioOnInteraction();
+
+        // Set up play/pause buttons
+        playBtn.addEventListener("click", playAudio);
+        pauseBtn.addEventListener("click", pauseAudio);
       }
 
       // Handle window resize
