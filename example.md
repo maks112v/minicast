@@ -7,7 +7,7 @@
 
 ```sh
 export CGO_CFLAGS="-I/opt/homebrew/include"
-export CGO_LDFLAGS="-L/opt/homebrew/lib"`
+export CGO_LDFLAGS="-L/opt/homebrew/lib"
 ```
 
 3. Start stream from microphone `go run cmd/source/main.go -url http://localhost:8001/source -user sourceuser -pass sourcepass`

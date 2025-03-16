@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Audio Streaming Client</title>
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        max-width: 600px;
+        margin: 0 auto;
+        padding: 20px;
+        text-align: center;
+      }
+      button {
+        font-size: 16px;
+        margin: 10px;
+        padding: 10px 20px;
+      }
+      #debugInfo {
+        margin-top: 20px;
+        text-align: left;
+        background-color: #f0f0f0;
+        padding: 10px;
+        white-space: pre-wrap;
+        max-height: 200px;
+        overflow-y: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Audio Streaming Client</h1>
+    <div>
+      <button id="startButton">Start Streaming</button>
+      <button id="stopButton" disabled>Stop Streaming</button>
+    </div>
+    <div id="status"></div>
+    <div id="debugInfo"></div>
+
+    <script>
+      class AudioStreamer {
+        constructor() {
+          this.mediaRecorder = null;
+          this.audioChunks = [];
+          this.isStreaming = false;
+          this.startButton = document.getElementById("startButton");
+          this.stopButton = document.getElementById("stopButton");
+          this.statusDiv = document.getElementById("status");
+          this.debugDiv = document.getElementById("debugInfo");
+
+          this.startButton.addEventListener("click", () =>
+            this.startStreaming()
+          );
+          this.stopButton.addEventListener("click", () => this.stopStreaming());
+        }
+
+        debug(message) {
+          console.log(message);
+          this.debugDiv.textContent += message + "\n";
+        }
+
+        async startStreaming() {
+          try {
+            // Clear previous debug info
+            this.debugDiv.textContent = "";
+
+            // Request microphone access
+            const stream = await navigator.mediaDevices.getUserMedia({
+              audio: {
+                echoCancellation: false,
+                noiseSuppression: false,
+                autoGainControl: false,
+              },
+            });
+
+            // Create media recorder
+            this.mediaRecorder = new MediaRecorder(stream, {
+              mimeType: this.findSupportedMimeType(),
+            });
+
+            this.debug(`Selected MIME Type: ${this.mediaRecorder.mimeType}`);
+
+            // Prepare streaming
+            this.audioChunks = [];
+            this.mediaRecorder.ondataavailable = async (event) => {
+              if (event.data.size > 0) {
+                try {
+                  this.audioChunks.push(event.data);
+                  await this.sendAudioChunk(event.data);
+                } catch (error) {
+                  this.debug(`Chunk processing error: ${error.message}`);
+                  this.updateStatus(`Chunk Error: ${error.message}`);
+                }
+              }
+            };
+
+            // Start recording and streaming
+            this.mediaRecorder.start(250); // Increased interval to 250ms
+            this.isStreaming = true;
+
+            // Update UI
+            this.startButton.disabled = true;
+            this.stopButton.disabled = false;
+            this.updateStatus("Streaming audio...");
+          } catch (error) {
+            this.debug(`Streaming start error: ${error.message}`);
+            this.updateStatus(`Error: ${error.message}`);
+            console.error("Streaming error:", error);
+          }
+        }
+
+        findSupportedMimeType() {
+          const mimeTypes = [
+            "audio/webm",
+            "audio/ogg",
+            "audio/mp4",
+            "audio/wav",
+          ];
+
+          for (let mimeType of mimeTypes) {
+            if (MediaRecorder.isTypeSupported(mimeType)) {
+              return mimeType;
+            }
+          }
+
+          throw new Error("No supported audio MIME type found");
+        }
+
+        async sendAudioChunk(chunk) {
+          try {
+            this.debug(`Chunk size: ${chunk.size} bytes`);
+            this.debug(`Chunk type: ${chunk.type}`);
+
+            // Log blob details
+            const arrayBuffer = await chunk.arrayBuffer();
+            this.debug(`ArrayBuffer size: ${arrayBuffer.byteLength} bytes`);
+
+            // Directly send the audio chunk as-is
+            const response = await fetch("http://localhost:8001/source", {
+              method: "PUT",
+              headers: {
+                Authorization: "Basic " + btoa("source:password"),
+                "Content-Type": chunk.type,
+              },
+              body: chunk,
+            });
+
+            if (!response.ok) {
+              const errorText = await response.text();
+              throw new Error(
+                `Server responded with ${response.status}: ${errorText}`
+              );
+            }
+          } catch (error) {
+            this.debug(`Send error details: ${error.message}`);
+            this.updateStatus(`Send error: ${error.message}`);
+            console.error("Send error:", error);
+            this.stopStreaming();
+          }
+        }
+
+        stopStreaming() {
+          if (this.mediaRecorder) {
+            this.mediaRecorder.stop();
+          }
+          this.isStreaming = false;
+
+          // Update UI
+          this.startButton.disabled = false;
+          this.stopButton.disabled = true;
+          this.updateStatus("Streaming stopped");
+        }
+
+        updateStatus(message) {
+          this.statusDiv.textContent = message;
+          this.debug(message);
+        }
+      }
+
+      // Initialize the audio streamer when the page loads
+      const audioStreamer = new AudioStreamer();
+    </script>
+  </body>
+</html>
